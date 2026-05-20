@@ -8,8 +8,9 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(__file__)
 KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
-TOLERANCE = 80  # Lower means stricter recognition
+TOLERANCE = 120  # Higher allows more realistic face matching values for LBPH
 MIN_FACE_SIZE = (80, 80)
+FACE_SIZE = (200, 200)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 DATE_COLOR = (0, 255, 0)
 DATE_FONT_SCALE = 1.0
@@ -19,7 +20,8 @@ DATE_THICKNESS = 2
 os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+face_cascade_alt = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+face_cascade_default = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 recognizer = None
 label_ids = {}
 id_to_name = {}
@@ -30,20 +32,37 @@ def sanitize_label(label: str) -> str:
 
 
 def detect_faces(gray_image):
-    if face_cascade is None or face_cascade.empty():
-        return []
-    return face_cascade.detectMultiScale(
-        gray_image,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=MIN_FACE_SIZE,
-    )
+    faces = []
+    
+    if face_cascade_alt is not None and not face_cascade_alt.empty():
+        faces = face_cascade_alt.detectMultiScale(
+            gray_image,
+            scaleFactor=1.05,
+            minNeighbors=4,
+            minSize=(40, 40),
+        )
+    
+    if len(faces) == 0 and face_cascade_default is not None and not face_cascade_default.empty():
+        faces = face_cascade_default.detectMultiScale(
+            gray_image,
+            scaleFactor=1.05,
+            minNeighbors=4,
+            minSize=(40, 40),
+        )
+    
+    return faces
 
 
-def make_face_image(image, rect):
-    x, y, w, h = rect
-    face = image[y:y+h, x:x+w]
-    return cv2.resize(face, (200, 200), interpolation=cv2.INTER_AREA)
+def prepare_face(gray_image, rect=None):
+    if rect is not None:
+        x, y, w, h = rect
+        face = gray_image[y:y+h, x:x+w]
+    else:
+        face = gray_image
+    face = cv2.resize(face, FACE_SIZE, interpolation=cv2.INTER_AREA)
+    face = cv2.equalizeHist(face)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(face)
 
 
 def train_recognizer():
@@ -64,11 +83,11 @@ def train_recognizer():
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         faces = detect_faces(gray)
         if len(faces) == 0:
-            print(f"Skipping {filename}: no face detected.")
-            continue
-
-        rect = faces[0]
-        face_image = make_face_image(gray, rect)
+            print(f"Warning: no face detected in {filename}. Using the full image instead.")
+            face_image = prepare_face(gray, None)
+        else:
+            rect = faces[0]
+            face_image = prepare_face(gray, rect)
         label_text = os.path.splitext(filename)[0]
         if "_" in label_text:
             label_text = label_text.rsplit("_", 1)[0]
@@ -84,7 +103,9 @@ def train_recognizer():
 
     if len(images) > 0:
         try:
-            recognizer = cv2.face.LBPHFaceRecognizer_create()
+            if not hasattr(cv2, 'face'):
+                raise RuntimeError("OpenCV was built without face module. Install opencv-contrib-python.")
+            recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=8, grid_x=8, grid_y=8)
             recognizer.train(images, np.array(labels))
             print(f"Trained recognizer on {len(images)} face samples for {len(label_ids)} label(s).")
         except Exception as e:
@@ -104,14 +125,14 @@ def predict_face(face_gray):
     try:
         label_id, confidence = recognizer.predict(face_gray)
         name = id_to_name.get(label_id, "Unknown")
-        if confidence > TOLERANCE:
+        if confidence is None or confidence > TOLERANCE:
             return "Unknown", confidence
         return name, confidence
     except Exception:
         return "Unknown", None
 
 
-def add_face_from_camera(cam, name, num_photos=3):
+def add_face_from_camera(cam, name, num_photos=5):
     label = sanitize_label(name)
     if not label:
         print("Invalid name.")
@@ -147,8 +168,9 @@ def add_face_from_camera(cam, name, num_photos=3):
             print("  Face too small, move closer.")
             continue
 
+        face_gray = prepare_face(gray, rect)
         filename = os.path.join(KNOWN_FACES_DIR, f"{label}_{captured + 1}.jpg")
-        cv2.imwrite(filename, frame)
+        cv2.imwrite(filename, face_gray)
         print(f"Saved: {filename}")
         captured += 1
 
@@ -206,10 +228,12 @@ def import_images(paths, label):
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             faces = detect_faces(gray)
             if len(faces) == 0:
-                print(f"  No face detected in {dest_name}; removing file.")
-                os.remove(dest_path)
-                continue
-
+                print(f"  No face detected in {dest_name}. Using full image fallback.")
+                face_gray = prepare_face(gray, None)
+            else:
+                rect = faces[0]
+                face_gray = prepare_face(gray, rect)
+            cv2.imwrite(dest_path, face_gray)
             added += 1
         except Exception as e:
             print(f"Failed to import {path}: {e}")
@@ -240,7 +264,7 @@ while True:
     cv2.putText(frame, now_str, (10, 10 + text_h), FONT, DATE_FONT_SCALE, DATE_COLOR, DATE_THICKNESS, cv2.LINE_AA)
 
     for (x, y, w, h) in faces:
-        face_gray = make_face_image(gray, (x, y, w, h))
+        face_gray = prepare_face(gray, (x, y, w, h))
         name, confidence = predict_face(face_gray)
         label_text = f"{name}"
         if confidence is not None and name != "Unknown":
